@@ -98,7 +98,11 @@ func (c *Common) RefreshCaptchaTokenInLogin(action, username string) error {
 	if ok, _ := regexp.MatchString(`\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*`, username); ok {
 		metas["email"] = username
 	} else if len(username) >= 11 && len(username) <= 18 {
+		// 定制版验证码网关(city404/v6-public-rpc-proto)的 /shield/captcha/init
+		// 要求 meta 必须含 username 字段(而非 phone_number)，否则报
+		// "meta.username expect <phone>, but got map[phone_number:...]"
 		metas["phone_number"] = username
+		metas["username"] = username
 	} else {
 		metas["username"] = username
 	}
