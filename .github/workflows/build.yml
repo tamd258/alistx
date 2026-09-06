@@ -36,6 +36,15 @@ jobs:
           mv -f dist public
           rm -rf dist.tar.gz
 
+      - name: Resolve missing dependencies
+        run: |
+          # 2026-09-01 提交把 db 驱动换成纯 Go 的 glebarez/sqlite(配合 CGO=0)，
+          # 但 go.mod / go.sum 未同步更新，构建时 internal/bootstrap/db.go 报
+          # "no required module provides package github.com/glebarez/sqlite"。
+          # 这里让 Go 自行补齐依赖清单。
+          go get github.com/glebarez/sqlite@v1.11.0
+          go mod tidy
+
       - name: Build Windows amd64
         run: |
           mkdir -p dist
