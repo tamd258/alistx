@@ -1,11 +1,9 @@
 package doubao_new
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/adler32"
 	"net/http"
@@ -15,12 +13,15 @@ import (
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/pkg/cookie"
 	"github.com/go-resty/resty/v2"
 )
 
 const (
 	BaseURL         = "https://my.feishu.cn"
 	DownloadBaseURL = "https://internal-api-drive-stream.feishu.cn"
+	DoubaoURL       = "https://www.doubao.com"
 )
 
 var defaultObjTypes = []string{"124", "0", "12", "30", "123", "22"}
@@ -29,14 +30,10 @@ func (d *DoubaoNew) request(ctx context.Context, path string, method string, cal
 	req := base.RestyClient.R()
 	req.SetContext(ctx)
 	req.SetHeader("accept", "*/*")
-	req.SetHeader("origin", "https://www.doubao.com")
-	req.SetHeader("referer", "https://www.doubao.com/")
-	req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-	if auth := d.resolveAuthorization(); auth != "" {
-		req.SetHeader("authorization", auth)
-	}
-	if dpop := d.resolveDpop(); dpop != "" {
-		req.SetHeader("dpop", dpop)
+	req.SetHeader("origin", DoubaoURL)
+	req.SetHeader("referer", DoubaoURL+"/")
+	if err := d.applyAuthHeaders(req, method, BaseURL+path); err != nil {
+		return nil, err
 	}
 
 	if callback != nil {
@@ -64,7 +61,7 @@ func (d *DoubaoNew) request(ctx context.Context, path string, method string, cal
 			string(body),
 			err,
 		)
-		return body, fmt.Errorf(msg)
+		return body, fmt.Errorf("%s", msg)
 	}
 	if common.Code != 0 {
 		errMsg := common.Msg
@@ -80,18 +77,6 @@ func (d *DoubaoNew) request(ctx context.Context, path string, method string, cal
 	}
 
 	return body, nil
-}
-
-func getCookieValue(cookie, name string) string {
-	parts := strings.Split(cookie, ";")
-	prefix := name + "="
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, prefix) {
-			return strings.TrimPrefix(part, prefix)
-		}
-	}
-	return ""
 }
 
 func adler32String(data []byte) string {
@@ -127,38 +112,25 @@ func previewList(items []string, n int) string {
 	return strings.Join(items[:n], ",")
 }
 
-func (d *DoubaoNew) resolveAuthorization() string {
-	auth := strings.TrimSpace(d.Authorization)
-	if auth == "" && d.Cookie != "" {
-		if token := getCookieValue(d.Cookie, "LARK_SUITE_ACCESS_TOKEN"); token != "" {
-			auth = token
-		}
+func parseSize(size string) int64 {
+	if size == "" {
+		return 0
 	}
-	if auth == "" {
-		return ""
+	val, err := strconv.ParseInt(size, 10, 64)
+	if err != nil {
+		return 0
 	}
-	if !strings.HasPrefix(auth, "DPoP ") && !strings.HasPrefix(auth, "dpop ") {
-		auth = "DPoP " + auth
-	}
-	return auth
+	return val
 }
 
-func (d *DoubaoNew) resolveDpop() string {
-	dpop := strings.TrimSpace(d.Dpop)
-	if dpop == "" && d.Cookie != "" {
-		dpop = getCookieValue(d.Cookie, "LARK_SUITE_DPOP")
-	}
-	return dpop
-}
-
-func (d *DoubaoNew) listChildren(ctx context.Context, parentToken string, lastLabel string) (ListData, error) {
+func (d *DoubaoNew) listChildren(ctx context.Context, parentToken string, lastLabel string, length int) (ListData, error) {
 	var resp ListResp
 	_, err := d.request(ctx, "/space/api/explorer/doubao/children/list/", http.MethodGet, func(req *resty.Request) {
 		values := url.Values{}
 		for _, t := range defaultObjTypes {
 			values.Add("obj_type", t)
 		}
-		values.Set("length", "50")
+		values.Set("length", strconv.Itoa(length))
 		values.Set("rank", "0")
 		values.Set("asc", "0")
 		values.Set("min_length", "40")
@@ -180,6 +152,42 @@ func (d *DoubaoNew) listChildren(ctx context.Context, parentToken string, lastLa
 	return resp.Data, nil
 }
 
+func (d *DoubaoNew) listAllChildren(ctx context.Context, parentToken string) ([]Node, error) {
+	length := 50
+	nodes := make([]Node, 0, length)
+	lastLabel := ""
+	for range 100 {
+		data, err := d.listChildren(ctx, parentToken, lastLabel, length)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(data.NodeList) > 0 {
+			for _, token := range data.NodeList {
+				node, ok := data.Entities.Nodes[token]
+				if !ok {
+					continue
+				}
+				nodes = append(nodes, node)
+			}
+		} else {
+			for _, node := range data.Entities.Nodes {
+				nodes = append(nodes, node)
+			}
+		}
+
+		if !data.HasMore || data.LastLabel == "" || data.LastLabel == lastLabel {
+			break
+		}
+		lastLabel = data.LastLabel
+	}
+
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	return nodes, nil
+}
+
 func (d *DoubaoNew) getFileInfo(ctx context.Context, fileToken string) (FileInfo, error) {
 	var resp FileInfoResp
 	_, err := d.request(ctx, "/space/api/box/file/info/", http.MethodPost, func(req *resty.Request) {
@@ -198,6 +206,104 @@ func (d *DoubaoNew) getFileInfo(ctx context.Context, fileToken string) (FileInfo
 	return resp.Data, nil
 }
 
+func (d *DoubaoNew) previewLink(ctx context.Context, obj *Object, args model.LinkArgs) (*model.Link, error) {
+	auth := d.resolveAuthorization()
+	dpop, err := d.resolveDpopForRequest(http.MethodGet, fmt.Sprintf("%s/space/api/box/stream/download/preview_sub/%s", BaseURL, obj.ObjToken))
+	if auth == "" || dpop == "" {
+		return nil, errors.New("missing authorization or dpop")
+	}
+	if obj.ObjToken == "" {
+		return nil, errors.New("missing obj_token")
+	}
+	info, err := d.getFileInfo(ctx, obj.ObjToken)
+	if err != nil {
+		return nil, err
+	}
+
+	entry, ok := info.PreviewMeta.Data["22"]
+	if !ok || entry.Status != 0 {
+		return nil, errors.New("preview not available")
+	}
+
+	subID := ""
+	pageIndex := 0
+
+	if subID == "" {
+		imgExt := ".webp"
+		pageNums := 0
+		if entry.Extra != "" {
+			var extra PreviewImageExtra
+			if err := json.Unmarshal([]byte(entry.Extra), &extra); err == nil {
+				if extra.ImgExt != "" {
+					imgExt = extra.ImgExt
+				}
+				pageNums = extra.PageNums
+			}
+		}
+		if pageNums > 0 && pageIndex >= pageNums {
+			pageIndex = pageNums - 1
+		}
+		subID = fmt.Sprintf("img_%d%s", pageIndex, imgExt)
+	}
+
+	query := url.Values{}
+	query.Set("preview_type", "22")
+	query.Set("sub_id", subID)
+	if info.Version != "" {
+		query.Set("version", info.Version)
+	}
+	previewURL := fmt.Sprintf("%s/space/api/box/stream/download/preview_sub/%s?%s", BaseURL, obj.ObjToken, query.Encode())
+
+	headers := http.Header{
+		"Referer":       []string{DoubaoURL + "/"},
+		"User-Agent":    []string{base.UserAgent},
+		"Authorization": []string{auth},
+		"Dpop":          []string{dpop},
+	}
+
+	return &model.Link{
+		URL:    previewURL,
+		Header: headers,
+	}, nil
+}
+
+func (d *DoubaoNew) createShare(ctx context.Context, obj *Object) error {
+	doRequest := func(csrfToken string) (*resty.Response, []byte, error) {
+		req := base.RestyClient.R()
+		req.SetContext(ctx)
+		req.SetHeader("accept", "application/json, text/plain, */*")
+		req.SetHeader("origin", DoubaoURL)
+		req.SetHeader("referer", DoubaoURL+"/")
+		if err := d.applyAuthHeaders(req, http.MethodPost, BaseURL+"/space/api/suite/permission/public/update.v5/"); err != nil {
+			return nil, nil, err
+		}
+		if csrfToken != "" {
+			req.SetHeader("x-csrftoken", csrfToken)
+		}
+		req.SetHeader("Content-Type", "application/json")
+		req.SetBody(base.Json{
+			"external_access_entity": 1,
+			"link_share_entity":      4,
+			"token":                  obj.ObjToken,
+			"type":                   obj.ObjType,
+		})
+		res, err := req.Execute(http.MethodPost, BaseURL+"/space/api/suite/permission/public/update.v5/")
+		if err != nil {
+			return nil, nil, err
+		}
+		return res, res.Body(), nil
+	}
+
+	res, body, err := doRequestWithCsrf(doRequest)
+	if err != nil {
+		return err
+	}
+	if err := decodeBaseResp(body, res); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (d *DoubaoNew) createFolder(ctx context.Context, parentToken, name string) (Node, error) {
 	data := url.Values{}
 	data.Set("name", name)
@@ -210,14 +316,10 @@ func (d *DoubaoNew) createFolder(ctx context.Context, parentToken, name string) 
 		req := base.RestyClient.R()
 		req.SetContext(ctx)
 		req.SetHeader("accept", "*/*")
-		req.SetHeader("origin", "https://www.doubao.com")
-		req.SetHeader("referer", "https://www.doubao.com/")
-		req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-		if auth := d.resolveAuthorization(); auth != "" {
-			req.SetHeader("authorization", auth)
-		}
-		if dpop := d.resolveDpop(); dpop != "" {
-			req.SetHeader("dpop", dpop)
+		req.SetHeader("origin", DoubaoURL)
+		req.SetHeader("referer", DoubaoURL+"/")
+		if err := d.applyAuthHeaders(req, http.MethodPost, BaseURL+"/space/api/explorer/v2/create/folder/"); err != nil {
+			return nil, nil, err
 		}
 		if csrfToken != "" {
 			req.SetHeader("x-csrftoken", csrfToken)
@@ -247,7 +349,7 @@ func (d *DoubaoNew) createFolder(ctx context.Context, parentToken, name string) 
 			string(body),
 			err,
 		)
-		return Node{}, fmt.Errorf(msg)
+		return Node{}, fmt.Errorf("%s", msg)
 	}
 
 	var node Node
@@ -290,14 +392,10 @@ func (d *DoubaoNew) renameFolder(ctx context.Context, token, name string) error 
 		req := base.RestyClient.R()
 		req.SetContext(ctx)
 		req.SetHeader("accept", "*/*")
-		req.SetHeader("origin", "https://www.doubao.com")
-		req.SetHeader("referer", "https://www.doubao.com/")
-		req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-		if auth := d.resolveAuthorization(); auth != "" {
-			req.SetHeader("authorization", auth)
-		}
-		if dpop := d.resolveDpop(); dpop != "" {
-			req.SetHeader("dpop", dpop)
+		req.SetHeader("origin", DoubaoURL)
+		req.SetHeader("referer", DoubaoURL+"/")
+		if err := d.applyAuthHeaders(req, http.MethodPost, BaseURL+"/space/api/explorer/v2/rename/"); err != nil {
+			return nil, nil, err
 		}
 		if csrfToken != "" {
 			req.SetHeader("x-csrftoken", csrfToken)
@@ -350,11 +448,11 @@ func extractCsrfTokenFromResponse(res *resty.Response) string {
 		return ""
 	}
 	if res.Request.RawRequest != nil {
-		if csrf := getCookieValue(res.Request.RawRequest.Header.Get("Cookie"), "_csrf_token"); csrf != "" {
+		if csrf := cookie.GetStr(res.Request.RawRequest.Header.Get("Cookie"), "_csrf_token"); csrf != "" {
 			return csrf
 		}
 	}
-	if csrf := getCookieValue(res.Request.Header.Get("Cookie"), "_csrf_token"); csrf != "" {
+	if csrf := cookie.GetStr(res.Request.Header.Get("Cookie"), "_csrf_token"); csrf != "" {
 		return csrf
 	}
 	for _, c := range res.Cookies() {
@@ -374,7 +472,7 @@ func decodeBaseResp(body []byte, res *resty.Response) error {
 			string(body),
 			err,
 		)
-		return fmt.Errorf(msg)
+		return fmt.Errorf("%s", msg)
 	}
 	if common.Code != 0 {
 		errMsg := common.Msg
@@ -413,14 +511,10 @@ func (d *DoubaoNew) moveObj(ctx context.Context, srcToken, destToken string) err
 		req := base.RestyClient.R()
 		req.SetContext(ctx)
 		req.SetHeader("accept", "*/*")
-		req.SetHeader("origin", "https://www.doubao.com")
-		req.SetHeader("referer", "https://www.doubao.com/")
-		req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-		if auth := d.resolveAuthorization(); auth != "" {
-			req.SetHeader("authorization", auth)
-		}
-		if dpop := d.resolveDpop(); dpop != "" {
-			req.SetHeader("dpop", dpop)
+		req.SetHeader("origin", DoubaoURL)
+		req.SetHeader("referer", DoubaoURL+"/")
+		if err := d.applyAuthHeaders(req, http.MethodPost, BaseURL+"/space/api/explorer/v2/move/"); err != nil {
+			return nil, nil, err
 		}
 		if csrfToken != "" {
 			req.SetHeader("x-csrftoken", csrfToken)
@@ -449,14 +543,10 @@ func (d *DoubaoNew) removeObj(ctx context.Context, tokens []string) error {
 		req := base.RestyClient.R()
 		req.SetContext(ctx)
 		req.SetHeader("accept", "application/json, text/plain, */*")
-		req.SetHeader("origin", "https://www.doubao.com")
-		req.SetHeader("referer", "https://www.doubao.com/")
-		req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-		if auth := d.resolveAuthorization(); auth != "" {
-			req.SetHeader("authorization", auth)
-		}
-		if dpop := d.resolveDpop(); dpop != "" {
-			req.SetHeader("dpop", dpop)
+		req.SetHeader("origin", DoubaoURL)
+		req.SetHeader("referer", DoubaoURL+"/")
+		if err := d.applyAuthHeaders(req, http.MethodPost, BaseURL+"/space/api/explorer/v3/remove/"); err != nil {
+			return nil, nil, err
 		}
 		if csrfToken != "" {
 			req.SetHeader("x-csrftoken", csrfToken)
@@ -485,7 +575,7 @@ func (d *DoubaoNew) removeObj(ctx context.Context, tokens []string) error {
 			string(body),
 			err,
 		)
-		return fmt.Errorf(msg)
+		return fmt.Errorf("%s", msg)
 	}
 	if resp.Code != 0 {
 		errMsg := resp.Msg
@@ -504,23 +594,19 @@ func (d *DoubaoNew) getUserStorage(ctx context.Context) (UserStorageData, error)
 	req := base.RestyClient.R()
 	req.SetContext(ctx)
 	req.SetHeader("accept", "*/*")
-	req.SetHeader("origin", "https://www.doubao.com")
-	req.SetHeader("referer", "https://www.doubao.com/")
-	req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
+	req.SetHeader("origin", DoubaoURL)
+	req.SetHeader("referer", DoubaoURL+"/")
 	req.SetHeader("agw-js-conv", "str")
 	req.SetHeader("content-type", "application/json")
-	if auth := d.resolveAuthorization(); auth != "" {
-		req.SetHeader("authorization", auth)
-	}
-	if dpop := d.resolveDpop(); dpop != "" {
-		req.SetHeader("dpop", dpop)
+	if err := d.applyAuthHeaders(req, http.MethodPost, DoubaoURL+"/alice/aispace/facade/get_user_storage"); err != nil {
+		return UserStorageData{}, err
 	}
 	if d.Cookie != "" {
 		req.SetHeader("cookie", d.Cookie)
 	}
 	req.SetBody(base.Json{})
 
-	res, err := req.Execute(http.MethodPost, "https://www.doubao.com/alice/aispace/facade/get_user_storage")
+	res, err := req.Execute(http.MethodPost, DoubaoURL+"/alice/aispace/facade/get_user_storage")
 	if err != nil {
 		return UserStorageData{}, err
 	}
@@ -534,7 +620,7 @@ func (d *DoubaoNew) getUserStorage(ctx context.Context) (UserStorageData, error)
 			string(body),
 			err,
 		)
-		return UserStorageData{}, fmt.Errorf(msg)
+		return UserStorageData{}, fmt.Errorf("%s", msg)
 	}
 	if resp.Code != 0 {
 		errMsg := resp.Msg
@@ -584,14 +670,10 @@ func (d *DoubaoNew) getTaskStatus(ctx context.Context, taskID string) (TaskStatu
 	req := base.RestyClient.R()
 	req.SetContext(ctx)
 	req.SetHeader("accept", "application/json, text/plain, */*")
-	req.SetHeader("origin", "https://www.doubao.com")
-	req.SetHeader("referer", "https://www.doubao.com/")
-	req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-	if auth := d.resolveAuthorization(); auth != "" {
-		req.SetHeader("authorization", auth)
-	}
-	if dpop := d.resolveDpop(); dpop != "" {
-		req.SetHeader("dpop", dpop)
+	req.SetHeader("origin", DoubaoURL)
+	req.SetHeader("referer", DoubaoURL+"/")
+	if err := d.applyAuthHeaders(req, http.MethodGet, BaseURL+"/space/api/explorer/v2/task/"); err != nil {
+		return TaskStatusData{}, err
 	}
 	req.SetQueryParam("task_id", taskID)
 	res, err := req.Execute(http.MethodGet, BaseURL+"/space/api/explorer/v2/task/")
@@ -607,7 +689,7 @@ func (d *DoubaoNew) getTaskStatus(ctx context.Context, taskID string) (TaskStatu
 			string(body),
 			err,
 		)
-		return TaskStatusData{}, fmt.Errorf(msg)
+		return TaskStatusData{}, fmt.Errorf("%s", msg)
 	}
 	if resp.Code != 0 {
 		errMsg := resp.Msg
@@ -628,282 +710,4 @@ func waitWithContext(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-func (d *DoubaoNew) prepareUpload(ctx context.Context, name string, size int64, mountNodeToken string) (UploadPrepareData, error) {
-	var resp UploadPrepareResp
-	_, err := d.request(ctx, "/space/api/box/upload/prepare/", http.MethodPost, func(req *resty.Request) {
-		values := url.Values{}
-		values.Set("shouldBypassScsDialog", "true")
-		values.Set("doubao_storage", "imagex_other")
-		values.Set("doubao_app_id", "497858")
-		req.SetQueryParamsFromValues(values)
-		req.SetHeader("Content-Type", "application/json")
-		req.SetHeader("x-command", "space.api.box.upload.prepare")
-		req.SetHeader("rpc-persist-doubao-pan", "true")
-		req.SetHeader("cache-control", "no-cache")
-		req.SetHeader("pragma", "no-cache")
-		body := base.Json{
-			"mount_point":      "explorer",
-			"mount_node_token": "",
-			"name":             name,
-			"size":             size,
-			"size_checker":     true,
-		}
-		if mountNodeToken != "" {
-			body["mount_node_token"] = mountNodeToken
-		}
-		req.SetBody(body)
-	}, &resp)
-	if err != nil {
-		return UploadPrepareData{}, err
-	}
-	return resp.Data, nil
-}
-
-func (d *DoubaoNew) uploadBlocks(ctx context.Context, uploadID string, blocks []UploadBlock, mountPoint string) (UploadBlocksData, error) {
-	if uploadID == "" {
-		return UploadBlocksData{}, fmt.Errorf("[doubao_new] upload blocks missing upload_id")
-	}
-	if mountPoint == "" {
-		mountPoint = "explorer"
-	}
-	var resp UploadBlocksResp
-	_, err := d.request(ctx, "/space/api/box/upload/blocks/", http.MethodPost, func(req *resty.Request) {
-		values := url.Values{}
-		values.Set("shouldBypassScsDialog", "true")
-		values.Set("doubao_storage", "imagex_other")
-		values.Set("doubao_app_id", "497858")
-		req.SetQueryParamsFromValues(values)
-		req.SetHeader("Content-Type", "application/json")
-		req.SetHeader("x-command", "space.api.box.upload.blocks")
-		req.SetHeader("rpc-persist-doubao-pan", "true")
-		req.SetHeader("cache-control", "no-cache")
-		req.SetHeader("pragma", "no-cache")
-		req.SetBody(base.Json{
-			"blocks":      blocks,
-			"upload_id":   uploadID,
-			"mount_point": mountPoint,
-		})
-	}, &resp)
-	if err != nil {
-		return UploadBlocksData{}, err
-	}
-	return resp.Data, nil
-}
-
-func (d *DoubaoNew) mergeUploadBlocks(ctx context.Context, uploadID string, seqList []int, checksumList []string, sizeList []int64, blockOriginSize int64, data []byte) (UploadMergeData, error) {
-	if uploadID == "" {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks missing upload_id")
-	}
-	if len(seqList) == 0 {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks empty seq list")
-	}
-	if len(checksumList) == 0 {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks empty checksum list")
-	}
-	if len(sizeList) != len(seqList) {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks size list mismatch")
-	}
-	if blockOriginSize <= 0 {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks invalid block origin size")
-	}
-	if len(data) == 0 {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks empty data")
-	}
-
-	seqHeader := joinIntComma(seqList)
-	checksumHeader := buildCommaHeader(checksumList)
-
-	client := base.NewRestyClient()
-	client.SetCookieJar(nil)
-	req := client.R()
-	req.SetContext(ctx)
-	req.SetHeader("accept", "application/json, text/plain, */*")
-	req.SetHeader("origin", "https://www.doubao.com")
-	req.SetHeader("referer", "https://www.doubao.com/")
-	req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-	req.SetHeader("rpc-persist-doubao-pan", "true")
-	req.SetHeader("content-type", "application/octet-stream")
-	req.Header.Set("x-block-list-checksum", checksumHeader)
-	req.Header.Set("x-seq-list", seqHeader)
-	req.SetHeader("x-block-origin-size", strconv.FormatInt(blockOriginSize, 10))
-	req.SetHeader("x-command", "space.api.box.stream.upload.merge_block")
-	req.SetHeader("x-csrftoken", "")
-	reqID := ""
-	if buf := make([]byte, 16); true {
-		if _, err := rand.Read(buf); err == nil {
-			reqID = hex.EncodeToString(buf)
-		}
-	}
-	if reqID != "" {
-		req.SetHeader("x-request-id", reqID)
-	}
-	if auth := d.resolveAuthorization(); auth != "" {
-		req.SetHeader("authorization", auth)
-	}
-	if dpop := d.resolveDpop(); dpop != "" {
-		req.SetHeader("dpop", dpop)
-	}
-	req.Header.Del("Cookie")
-	req.Header.Del("cookie")
-	if req.Header.Get("x-command") == "" {
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] merge blocks missing x-command header")
-	}
-	req.SetBody(data)
-
-	values := url.Values{}
-	values.Set("shouldBypassScsDialog", "true")
-	values.Set("upload_id", uploadID)
-	values.Set("mount_point", "explorer")
-	values.Set("doubao_storage", "imagex_other")
-	values.Set("doubao_app_id", "497858")
-	urlStr := "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/upload/merge_block/?" + values.Encode()
-
-	res, err := req.Execute(http.MethodPost, urlStr)
-	if err != nil {
-		return UploadMergeData{}, err
-	}
-	if v := res.Header().Get("X-Tt-Logid"); v != "" {
-		d.TtLogid = v
-	} else if v := res.Header().Get("x-tt-logid"); v != "" {
-		d.TtLogid = v
-	}
-	body := res.Body()
-	var resp UploadMergeResp
-	if err := json.Unmarshal(body, &resp); err != nil {
-		msg := fmt.Sprintf("[doubao_new] decode response failed (status: %s, content-type: %s, body: %s): %v",
-			res.Status(),
-			res.Header().Get("Content-Type"),
-			string(body),
-			err,
-		)
-		return UploadMergeData{}, fmt.Errorf(msg)
-	}
-	if resp.Code != 0 {
-		if res != nil && res.StatusCode() == http.StatusBadRequest && resp.Code == 2 {
-			success := make([]int, 0, len(seqList))
-			offset := 0
-			for i, seq := range seqList {
-				size := sizeList[i]
-				if size <= 0 {
-					return UploadMergeData{SuccessSeqList: success}, fmt.Errorf("[doubao_new] v3 fallback invalid size: seq=%d size=%d", seq, size)
-				}
-				if offset+int(size) > len(data) {
-					return UploadMergeData{SuccessSeqList: success}, fmt.Errorf("[doubao_new] v3 fallback payload out of range: seq=%d offset=%d size=%d total=%d", seq, offset, size, len(data))
-				}
-				payload := data[offset : offset+int(size)]
-				block := UploadBlockNeed{
-					Seq:      seq,
-					Size:     size,
-					Checksum: checksumList[i],
-				}
-				if err := d.uploadBlockV3(ctx, uploadID, block, payload); err != nil {
-					return UploadMergeData{SuccessSeqList: success}, err
-				}
-				success = append(success, seq)
-				offset += int(size)
-			}
-			return UploadMergeData{SuccessSeqList: success}, nil
-		}
-		errMsg := resp.Msg
-		if errMsg == "" {
-			errMsg = resp.Message
-		}
-		return UploadMergeData{}, fmt.Errorf("[doubao_new] API error (code: %d): %s", resp.Code, errMsg)
-	}
-
-	return resp.Data, nil
-}
-
-func (d *DoubaoNew) uploadBlockV3(ctx context.Context, uploadID string, block UploadBlockNeed, data []byte) error {
-	if uploadID == "" {
-		return fmt.Errorf("[doubao_new] upload v3 block missing upload_id")
-	}
-	if block.Seq < 0 {
-		return fmt.Errorf("[doubao_new] upload v3 block invalid seq")
-	}
-	if len(data) == 0 {
-		return fmt.Errorf("[doubao_new] upload v3 block empty data")
-	}
-
-	req := base.RestyClient.R()
-	req.SetContext(ctx)
-	req.SetHeader("accept", "*/*")
-	req.SetHeader("origin", "https://www.doubao.com")
-	req.SetHeader("referer", "https://www.doubao.com/")
-	req.SetHeader("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
-	req.SetHeader("rpc-persist-doubao-pan", "true")
-	req.SetHeader("x-block-seq", strconv.Itoa(block.Seq))
-	req.SetHeader("x-block-checksum", block.Checksum)
-	if auth := d.resolveAuthorization(); auth != "" {
-		req.SetHeader("authorization", auth)
-	}
-	if dpop := d.resolveDpop(); dpop != "" {
-		req.SetHeader("dpop", dpop)
-	}
-
-	req.SetMultipartFormData(map[string]string{
-		"upload_id": uploadID,
-		"size":      strconv.FormatInt(int64(len(data)), 10),
-	})
-	req.SetMultipartField("file", "blob", "application/octet-stream", bytes.NewReader(data))
-
-	values := url.Values{}
-	values.Set("shouldBypassScsDialog", "true")
-	values.Set("upload_id", uploadID)
-	values.Set("seq", strconv.Itoa(block.Seq))
-	values.Set("size", strconv.FormatInt(int64(len(data)), 10))
-	values.Set("checksum", block.Checksum)
-	values.Set("mount_point", "explorer")
-	values.Set("doubao_storage", "imagex_other")
-	values.Set("doubao_app_id", "497858")
-	urlStr := "https://internal-api-drive-stream.feishu.cn/space/api/box/stream/upload/v3/block/?" + values.Encode()
-
-	res, err := req.Execute(http.MethodPost, urlStr)
-	if err != nil {
-		return err
-	}
-	body := res.Body()
-	if err := decodeBaseResp(body, res); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (d *DoubaoNew) finishUpload(ctx context.Context, uploadID string, numBlocks int, mountPoint string) (UploadFinishData, error) {
-	if uploadID == "" {
-		return UploadFinishData{}, fmt.Errorf("[doubao_new] finish upload missing upload_id")
-	}
-	if numBlocks <= 0 {
-		return UploadFinishData{}, fmt.Errorf("[doubao_new] finish upload invalid num_blocks")
-	}
-	if mountPoint == "" {
-		mountPoint = "explorer"
-	}
-	var resp UploadFinishResp
-	_, err := d.request(ctx, "/space/api/box/upload/finish/", http.MethodPost, func(req *resty.Request) {
-		values := url.Values{}
-		values.Set("shouldBypassScsDialog", "true")
-		values.Set("doubao_storage", "imagex_other")
-		values.Set("doubao_app_id", "497858")
-		req.SetQueryParamsFromValues(values)
-		req.SetHeader("Content-Type", "application/json")
-		req.SetHeader("x-command", "space.api.box.upload.finish")
-		req.SetHeader("rpc-persist-doubao-pan", "true")
-		req.SetHeader("cache-control", "no-cache")
-		req.SetHeader("pragma", "no-cache")
-		req.SetHeader("biz-scene", "file_upload")
-		req.SetHeader("biz-ua-type", "Web")
-		req.SetBody(base.Json{
-			"upload_id":                uploadID,
-			"num_blocks":               numBlocks,
-			"mount_point":              mountPoint,
-			"push_open_history_record": 1,
-		})
-	}, &resp)
-	if err != nil {
-		return UploadFinishData{}, err
-	}
-	return resp.Data, nil
 }

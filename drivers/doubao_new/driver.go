@@ -3,6 +3,7 @@ package doubao_new
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -12,47 +13,37 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
-	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
-	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/cookie"
+	"github.com/alist-org/alist/v3/pkg/utils"
 )
-
-// removeCachedTempFile 删除「框架为本次上传临时落盘」的缓存文件。
-//
-// 背景：上游 OpenList 的 fix(#2530) 直接 os.Remove(tmpFile.Name())。
-// 但 alist v3 的 FileStream/SeekableStream.CacheFullInTempFile() 在流本身已经是
-// model.File 时（例如上传本地磁盘文件、跨存储复制时源端给的就是 *os.File），
-// 会把调用方传进来的文件原样返回 —— 那种情况下直接删会把源文件干掉。
-// 因此这里只删「确实位于框架 TempDir 下」的缓存文件，其余一律不动。
-func removeCachedTempFile(f model.File) {
-	of, ok := f.(*os.File)
-	if !ok {
-		return
-	}
-	dir, err := filepath.Abs(conf.Conf.TempDir)
-	if err != nil {
-		return
-	}
-	name, err := filepath.Abs(of.Name())
-	if err != nil {
-		return
-	}
-	if filepath.Dir(name) == dir {
-		_ = os.Remove(of.Name())
-	}
-}
 
 type DoubaoNew struct {
 	model.Storage
 	Addition
 	TtLogid string
+
+	// DPoP access token (Authorization header value, without DPoP prefix)
+	Authorization       string
+	AuthorizationPublic string
+	// DPoP header value
+	DPoP       string
+	DPoPPublic string
+	// DPoP key pair for generating DPoP
+	DPoPKeyPairStr string
+	DPoPKeyPair    *ecdsa.PrivateKey
+
+	authRefreshMu       sync.Mutex
+	authRefreshPublicMu sync.Mutex
 }
 
 func (d *DoubaoNew) Config() driver.Config {
@@ -64,12 +55,36 @@ func (d *DoubaoNew) GetAddition() driver.Additional {
 }
 
 func (d *DoubaoNew) Init(ctx context.Context) error {
-	// TODO login / refresh token
-	//op.MustSaveDriverStorage(d)
+	if cookieStr := strings.TrimSpace(d.Cookie); cookieStr != "" {
+		d.Cookie = cookieStr
+		auth := trimTokenScheme(cookie.GetStr(d.Cookie, "LARK_SUITE_ACCESS_TOKEN"))
+		if auth != "" {
+			d.Authorization = auth
+		}
+		dpop := strings.TrimSpace(cookie.GetStr(d.Cookie, "LARK_SUITE_DPOP"))
+		if dpop != "" {
+			d.DPoP = dpop
+		}
+		keypair := strings.TrimSpace(cookie.GetStr(d.Cookie, "feishu_dpop_keypair"))
+		if keypair != "" && d.DPoPKeySecret != "" {
+			d.DPoPKeyPairStr = keypair
+			d.DPoPKeyPair, _ = parseEncryptedDPoPKeyPair(keypair, d.DPoPKeySecret)
+		}
+	}
 	return nil
 }
 
 func (d *DoubaoNew) Drop(ctx context.Context) error {
+	if d.Authorization != "" {
+		d.Cookie = cookie.SetStr(d.Cookie, "LARK_SUITE_ACCESS_TOKEN", d.Authorization)
+	}
+	if d.DPoP != "" {
+		d.Cookie = cookie.SetStr(d.Cookie, "LARK_SUITE_DPOP", d.DPoP)
+	}
+	if d.DPoPKeyPairStr != "" {
+		d.Cookie = cookie.SetStr(d.Cookie, "feishu_dpop_keypair", d.DPoPKeyPairStr)
+	}
+	op.MustSaveDriverStorage(d)
 	return nil
 }
 
@@ -81,8 +96,16 @@ func (d *DoubaoNew) List(ctx context.Context, dir model.Obj, args model.ListArgs
 
 	objs := make([]model.Obj, 0, len(nodes))
 	for _, node := range nodes {
+		if node.NodeToken == "" || node.ObjToken == "" {
+			continue
+		}
+
 		size := parseSize(node.Extra.Size)
 		isFolder := node.Type == 0
+		if isFolder && node.NodeToken == dir.GetID() {
+			continue
+		}
+
 		obj := &Object{
 			Object: model.Object{
 				ID:       node.NodeToken,
@@ -110,15 +133,31 @@ func (d *DoubaoNew) Link(ctx context.Context, file model.Obj, args model.LinkArg
 		return nil, errors.New("unsupported object type")
 	}
 	if obj.IsFolder {
-		return nil, errs.LinkIsDir
+		return nil, fmt.Errorf("link is directory")
 	}
-	if args.Type == "preview" || args.Type == "thumb" {
-		if link, err := d.previewLink(ctx, obj, args); err == nil {
-			return link, nil
+	var (
+		err        error
+		auth, dpop string
+	)
+	if d.ShareLink {
+		err := d.createShare(ctx, obj)
+		if err != nil {
+			return nil, err
 		}
+		dpop, auth, err = d.resolveAuthorizationForPublic()
+	} else {
+		// TODO: append previewLink() with auth args to support ShareLink
+		if args.Type == "preview" || args.Type == "thumb" {
+			if link, err := d.previewLink(ctx, obj, args); err == nil {
+				return link, nil
+			}
+		}
+		auth = d.resolveAuthorization()
+		dpop, err = d.resolveDpopForRequest(http.MethodGet, DownloadBaseURL+"/space/api/box/stream/download/all/"+obj.ObjToken+"/")
 	}
-	auth := d.resolveAuthorization()
-	dpop := d.resolveDpop()
+	if err != nil {
+		return nil, err
+	}
 	if auth == "" || dpop == "" {
 		return nil, errors.New("missing authorization or dpop")
 	}
@@ -133,7 +172,7 @@ func (d *DoubaoNew) Link(ctx context.Context, file model.Obj, args model.LinkArg
 	downloadURL := DownloadBaseURL + "/space/api/box/stream/download/all/" + obj.ObjToken + "/?" + query.Encode()
 
 	headers := http.Header{
-		"Referer":    []string{"https://www.doubao.com/"},
+		"Referer":    []string{DoubaoURL + "/"},
 		"User-Agent": []string{base.UserAgent},
 	}
 
@@ -258,15 +297,13 @@ func (d *DoubaoNew) Put(ctx context.Context, dstDir model.Obj, file model.FileSt
 		return nil, errors.New("invalid block size from prepare")
 	}
 
-	tmpFile, err := file.CacheFullInTempFile()
+	tmpFile, err := utils.CreateTempFile(file, file.GetSize())
 	if err != nil {
 		return nil, err
 	}
-	// 对齐上游 fix(#2530)：跨存储上传会落磁盘缓存（temp 目录 file-*），用完顺手删掉，
-	// 不要只依赖框架 Close()/定时 CleanTempDir，避免大文件上传后临时目录堆积。
 	defer func() {
 		_ = tmpFile.Close()
-		removeCachedTempFile(tmpFile)
+		_ = os.Remove(tmpFile.Name())
 	}()
 
 	blockSize := uploadPrep.BlockSize
@@ -328,16 +365,6 @@ func (d *DoubaoNew) Put(ctx context.Context, dstDir model.Obj, file model.FileSt
 			}
 			data := groupBuf.Bytes()
 			expectLen := groupExpectSum
-			if len(data) > 0 {
-				headLen := 32
-				if len(data) < headLen {
-					headLen = len(data)
-				}
-				tailLen := 32
-				if len(data) < tailLen {
-					tailLen = len(data)
-				}
-			}
 			if int64(len(data)) != expectLen {
 				return fmt.Errorf("[doubao_new] merge blocks invalid body len: got=%d expect=%d seqs=%v", len(data), expectLen, groupSeqs)
 			}
@@ -450,26 +477,17 @@ func (d *DoubaoNew) Put(ctx context.Context, dstDir model.Obj, file model.FileSt
 	}, nil
 }
 
-func (d *DoubaoNew) GetArchiveMeta(ctx context.Context, obj model.Obj, args model.ArchiveArgs) (model.ArchiveMeta, error) {
-	// TODO get archive file meta-info, return errs.NotImplement to use an internal archive tool, optional
-	return nil, errs.NotImplement
-}
-
-func (d *DoubaoNew) ListArchive(ctx context.Context, obj model.Obj, args model.ArchiveInnerArgs) ([]model.Obj, error) {
-	// TODO list args.InnerPath in the archive obj, return errs.NotImplement to use an internal archive tool, optional
-	return nil, errs.NotImplement
-}
-
-func (d *DoubaoNew) Extract(ctx context.Context, obj model.Obj, args model.ArchiveInnerArgs) (*model.Link, error) {
-	// TODO return link of file args.InnerPath in the archive obj, return errs.NotImplement to use an internal archive tool, optional
-	return nil, errs.NotImplement
-}
-
-func (d *DoubaoNew) ArchiveDecompress(ctx context.Context, srcObj, dstDir model.Obj, args model.ArchiveDecompressArgs) ([]model.Obj, error) {
-	// TODO extract args.InnerPath path in the archive srcObj to the dstDir location, optional
-	// a folder with the same name as the archive file needs to be created to store the extracted results if args.PutIntoNewDir
-	// return errs.NotImplement to use an internal archive tool
-	return nil, errs.NotImplement
+func (d *DoubaoNew) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
+	data, err := d.getUserStorage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &model.StorageDetails{
+		DiskUsage: model.DiskUsage{
+			TotalSpace: data.TotalSizeLimitBytes,
+			UsedSpace:  data.UsedSizeBytes,
+		},
+	}, nil
 }
 
 func (d *DoubaoNew) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
@@ -510,116 +528,6 @@ func (d *DoubaoNew) Other(ctx context.Context, args model.OtherArgs) (interface{
 	default:
 		return nil, errs.NotSupport
 	}
-}
-
-func (d *DoubaoNew) listAllChildren(ctx context.Context, parentToken string) ([]Node, error) {
-	nodes := make([]Node, 0, 50)
-	lastLabel := ""
-	for page := 0; page < 100; page++ {
-		data, err := d.listChildren(ctx, parentToken, lastLabel)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, token := range data.NodeList {
-			node, ok := data.Entities.Nodes[token]
-			if !ok {
-				continue
-			}
-			nodes = append(nodes, node)
-		}
-
-		if !data.HasMore || data.LastLabel == "" || data.LastLabel == lastLabel {
-			break
-		}
-		lastLabel = data.LastLabel
-	}
-
-	if len(nodes) == 0 {
-		return nil, nil
-	}
-	return nodes, nil
-}
-
-func (d *DoubaoNew) previewLink(ctx context.Context, obj *Object, args model.LinkArgs) (*model.Link, error) {
-	auth := d.resolveAuthorization()
-	dpop := d.resolveDpop()
-	if auth == "" || dpop == "" {
-		return nil, errors.New("missing authorization or dpop")
-	}
-	if obj.ObjToken == "" {
-		return nil, errors.New("missing obj_token")
-	}
-	info, err := d.getFileInfo(ctx, obj.ObjToken)
-	if err != nil {
-		return nil, err
-	}
-
-	entry, ok := info.PreviewMeta.Data["22"]
-	if !ok || entry.Status != 0 {
-		return nil, errors.New("preview not available")
-	}
-
-	subID := ""
-	pageIndex := 0
-	if args.HttpReq != nil {
-		query := args.HttpReq.URL.Query()
-		if v := query.Get("sub_id"); v != "" {
-			subID = v
-		} else if v := query.Get("page"); v != "" {
-			if p, err := strconv.Atoi(v); err == nil && p >= 0 {
-				pageIndex = p
-			}
-		}
-	}
-	if subID == "" {
-		imgExt := ".webp"
-		pageNums := 0
-		if entry.Extra != "" {
-			var extra PreviewImageExtra
-			if err := json.Unmarshal([]byte(entry.Extra), &extra); err == nil {
-				if extra.ImgExt != "" {
-					imgExt = extra.ImgExt
-				}
-				pageNums = extra.PageNums
-			}
-		}
-		if pageNums > 0 && pageIndex >= pageNums {
-			pageIndex = pageNums - 1
-		}
-		subID = fmt.Sprintf("img_%d%s", pageIndex, imgExt)
-	}
-
-	query := url.Values{}
-	query.Set("preview_type", "22")
-	query.Set("sub_id", subID)
-	if info.Version != "" {
-		query.Set("version", info.Version)
-	}
-	previewURL := fmt.Sprintf("%s/space/api/box/stream/download/preview_sub/%s?%s", BaseURL, obj.ObjToken, query.Encode())
-
-	headers := http.Header{
-		"Referer":       []string{"https://www.doubao.com/"},
-		"User-Agent":    []string{base.UserAgent},
-		"Authorization": []string{auth},
-		"Dpop":          []string{dpop},
-	}
-
-	return &model.Link{
-		URL:    previewURL,
-		Header: headers,
-	}, nil
-}
-
-func parseSize(size string) int64 {
-	if size == "" {
-		return 0
-	}
-	val, err := strconv.ParseInt(size, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return val
 }
 
 var _ driver.Driver = (*DoubaoNew)(nil)
