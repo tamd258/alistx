@@ -32,6 +32,16 @@ jobs:
 
       - name: Start alist server
         run: |
+          mkdir -p /tmp/alist/dist
+          printf '<!doctype html><title>bench</title>' > /tmp/alist/dist/index.html
+          python3 - <<'PY'
+          import json
+          p = "/tmp/alist/data/config.json"
+          c = json.load(open(p))
+          c["dist_dir"] = "/tmp/alist/dist"
+          json.dump(c, open(p, "w"), indent=2)
+          print("dist_dir ->", c["dist_dir"])
+          PY
           cd /tmp/alist
           nohup /tmp/alist-doubao server > /tmp/alist/server.log 2>&1 &
           sleep 12
