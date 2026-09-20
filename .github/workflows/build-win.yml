@@ -1,0 +1,45 @@
+name: Build Windows AMD64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Fetch Web (frontend)
+        run: |
+          curl -L https://github.com/ykxVK8yL5L/alist-web/releases/latest/download/dist.tar.gz -o dist.tar.gz
+          tar -zxvf dist.tar.gz
+          rm -rf public/dist
+          mv -f dist public
+          rm -f dist.tar.gz
+
+      - name: Build (native cross compile)
+        run: |
+          mkdir -p build/compress
+          version=$(git describe --tags --always 2>/dev/null || echo "dev")
+          builtAt="$(date +'%F %T %z')"
+          ldflags="-w -s -X github.com/alist-org/alist/v3/internal/conf.Version=${version} -X github.com/alist-org/alist/v3/internal/conf.BuiltAt=${builtAt}"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags=jsoniter -ldflags="${ldflags}" -o build/compress/alist-windows-amd64.exe .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alist-windows-amd64
+          path: build/compress/
