@@ -61,13 +61,20 @@ if do_up:
         print("UPLOAD FAILED", flush=True)
 
 if do_down:
-    s, d = api("POST", "/api/fs/get", {"path": name}, token=tok)
     raw_url = ""
-    try:
-        raw_url = json.loads(d)["data"].get("raw_url") or ""
-    except Exception:
-        pass
-    print("get raw_url:", s, raw_url[:120], flush=True)
+    for attempt in range(4):
+        s, d = api("POST", "/api/fs/get", {"path": name}, token=tok)
+        try:
+            raw_url = json.loads(d)["data"].get("raw_url") or ""
+        except Exception:
+            raw_url = ""
+        print("get raw_url (try %d): %s %s" % (attempt + 1, s, raw_url[:120]), flush=True)
+        if raw_url:
+            break
+        time.sleep(4)
+    if not raw_url:
+        raw_url = AL + "/d" + urllib.parse.quote(name, safe="/")
+        print("fallback to /d/ direct:", raw_url[:160], flush=True)
     if raw_url.startswith("/"):
         raw_url = AL + raw_url
     if raw_url:
