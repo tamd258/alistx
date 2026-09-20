@@ -1,0 +1,65 @@
+name: GoogleDrive Upload/Download Speed Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: 'Test file size in MB'
+        required: false
+        default: '200'
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build alist (linux amd64)
+        run: |
+          go get github.com/glebarez/sqlite
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags=jsoniter -ldflags="-s -w" -o /tmp/alist-bench .
+
+      - name: Init alist and set admin password
+        run: |
+          mkdir -p /tmp/alist
+          cd /tmp/alist
+          /tmp/alist-bench admin set aaaaa6 2>&1 | tail -3 || true
+
+      - name: Start alist server
+        run: |
+          mkdir -p /tmp/alist/dist
+          printf '<!doctype html><title>bench</title>' > /tmp/alist/dist/index.html
+          python3 - <<'PY'
+          import json
+          p = "/tmp/alist/data/config.json"
+          c = json.load(open(p))
+          c["dist_dir"] = "/tmp/alist/dist"
+          json.dump(c, open(p, "w"), indent=2)
+          print("dist_dir ->", c["dist_dir"])
+          PY
+          cd /tmp/alist
+          nohup /tmp/alist-bench server > /tmp/alist/server.log 2>&1 &
+          sleep 12
+          echo "----- server.log -----"
+          tail -20 /tmp/alist/server.log
+          echo "----- probe -----"
+          curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5244/api/public/settings
+
+      - name: Benchmark GoogleDrive2 upload/download
+        env:
+          DRIVER: GoogleDrive
+          MOUNT_PATH: /GoogleDrive2
+          ADDITION: ${{ secrets.GD2_ADDITION }}
+          SIZE_MB: ${{ github.event.inputs.size_mb }}
+          DO_UPLOAD: '1'
+          DO_DOWNLOAD: '1'
+        run: python3 .github/scripts/bench_generic.py
+
+      - name: Show alist log
+        if: always()
+        run: tail -80 /tmp/alist/server.log
