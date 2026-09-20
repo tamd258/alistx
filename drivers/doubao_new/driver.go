@@ -477,19 +477,6 @@ func (d *DoubaoNew) Put(ctx context.Context, dstDir model.Obj, file model.FileSt
 	}, nil
 }
 
-func (d *DoubaoNew) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
-	data, err := d.getUserStorage(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return &model.StorageDetails{
-		DiskUsage: model.DiskUsage{
-			TotalSpace: data.TotalSizeLimitBytes,
-			UsedSpace:  data.UsedSizeBytes,
-		},
-	}, nil
-}
-
 func (d *DoubaoNew) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
 	switch args.Method {
 	case "doubao_preview", "preview":
