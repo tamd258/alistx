@@ -11,15 +11,43 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
 )
+
+// removeCachedTempFile 删除「框架为本次上传临时落盘」的缓存文件。
+//
+// 背景：上游 OpenList 的 fix(#2530) 直接 os.Remove(tmpFile.Name())。
+// 但 alist v3 的 FileStream/SeekableStream.CacheFullInTempFile() 在流本身已经是
+// model.File 时（例如上传本地磁盘文件、跨存储复制时源端给的就是 *os.File），
+// 会把调用方传进来的文件原样返回 —— 那种情况下直接删会把源文件干掉。
+// 因此这里只删「确实位于框架 TempDir 下」的缓存文件，其余一律不动。
+func removeCachedTempFile(f model.File) {
+	of, ok := f.(*os.File)
+	if !ok {
+		return
+	}
+	dir, err := filepath.Abs(conf.Conf.TempDir)
+	if err != nil {
+		return
+	}
+	name, err := filepath.Abs(of.Name())
+	if err != nil {
+		return
+	}
+	if filepath.Dir(name) == dir {
+		_ = os.Remove(of.Name())
+	}
+}
 
 type DoubaoNew struct {
 	model.Storage
@@ -234,7 +262,12 @@ func (d *DoubaoNew) Put(ctx context.Context, dstDir model.Obj, file model.FileSt
 	if err != nil {
 		return nil, err
 	}
-	defer tmpFile.Close()
+	// 对齐上游 fix(#2530)：跨存储上传会落磁盘缓存（temp 目录 file-*），用完顺手删掉，
+	// 不要只依赖框架 Close()/定时 CleanTempDir，避免大文件上传后临时目录堆积。
+	defer func() {
+		_ = tmpFile.Close()
+		removeCachedTempFile(tmpFile)
+	}()
 
 	blockSize := uploadPrep.BlockSize
 	totalSize := file.GetSize()

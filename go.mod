@@ -75,16 +75,24 @@ require (
 	gorm.io/driver/mysql v1.4.7
 	gorm.io/driver/postgres v1.4.8
 	gorm.io/driver/sqlite v1.4.4
-	gorm.io/gorm v1.24.5
+	gorm.io/gorm v1.25.7
 )
 
 require (
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect
 	github.com/cloudwego/iasm v0.2.0 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/glebarez/go-sqlite v1.21.2 // indirect
+	github.com/glebarez/sqlite v1.11.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/halalcloud/golang-sdk-lite v0.0.0-20260114141156-c98fb447a544 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
+	modernc.org/libc v1.22.5 // indirect
+	modernc.org/mathutil v1.5.0 // indirect
+	modernc.org/memory v1.5.0 // indirect
+	modernc.org/sqlite v1.23.1 // indirect
 )
 
 require (
@@ -170,7 +178,7 @@ require (
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.15 // indirect
-	github.com/mattn/go-sqlite3 v1.14.15 // indirect
+	github.com/mattn/go-sqlite3 v1.14.16 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
