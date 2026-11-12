@@ -19,8 +19,12 @@ const (
 	ua      = "okhttp/3.12.13"
 )
 
-// 通用请求：返回原始 JSON body
+// 通用请求：返回原始 JSON body。遇到 session 过期(60001)/未登录(60002) 会自动重新登录并重试一次。
 func (d *WxYunPan) request(ctx context.Context, method, path string, body interface{}) (json.RawMessage, error) {
+	return d.requestRetry(ctx, method, path, body, true)
+}
+
+func (d *WxYunPan) requestRetry(ctx context.Context, method, path string, body interface{}, allowRelogin bool) (json.RawMessage, error) {
 	var reqBody io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -60,10 +64,11 @@ func (d *WxYunPan) request(ctx context.Context, method, path string, body interf
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
 		return nil, fmt.Errorf("解析响应失败: %s", truncate(string(raw), 200))
 	}
-	// 60002 = 未登录/session 失效
-	if wrapper.Code == 60002 && d.Addition.SessionKey == "" {
+	// 60001 = 登录过期，60002 = 未登录/session 失效 → 清空旧 sessionKey 重新登录后重试一次
+	if (wrapper.Code == 60001 || wrapper.Code == 60002) && allowRelogin {
+		d.sessionKey = ""
 		if err := d.login(ctx); err == nil {
-			return d.request(ctx, method, path, body)
+			return d.requestRetry(ctx, method, path, body, false)
 		}
 	}
 	if wrapper.Code != 200 && wrapper.Code != 5555 {
