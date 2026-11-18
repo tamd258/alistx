@@ -18,7 +18,8 @@ const (
 	ua      = "okhttp/3.12.13"
 )
 
-// 閫氱敤璇锋眰锛氳繑鍥炲師濮?JSON body銆傞亣鍒?session 杩囨湡(60001)/鏈櫥褰?60002) 浼氳嚜鍔ㄩ噸鏂扮櫥褰曞苟閲嶈瘯涓€娆°€?func (d *WxYunPan) request(ctx context.Context, method, path string, body interface{}) (json.RawMessage, error) {
+// 通用请求：返回原始 JSON body。遇到 session 过期(60001)/未登录(60002) 会自动重新登录并重试一次。
+func (d *WxYunPan) request(ctx context.Context, method, path string, body interface{}) (json.RawMessage, error) {
 	return d.requestRetry(ctx, method, path, body, true)
 }
 
@@ -60,9 +61,10 @@ func (d *WxYunPan) requestRetry(ctx context.Context, method, path string, body i
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
-		return nil, fmt.Errorf("瑙ｆ瀽鍝嶅簲澶辫触: %s", truncate(string(raw), 200))
+		return nil, fmt.Errorf("解析响应失败: %s", truncate(string(raw), 200))
 	}
-	// 60001 = 鐧诲綍杩囨湡锛?0002 = 鏈櫥褰?session 澶辨晥 鈫?娓呯┖鏃?sessionKey 閲嶆柊鐧诲綍鍚庨噸璇曚竴娆?	if (wrapper.Code == 60001 || wrapper.Code == 60002) && allowRelogin {
+	// 60001 = 登录过期，60002 = 未登录/session 失效 → 清空旧 sessionKey 重新登录后重试一次
+	if (wrapper.Code == 60001 || wrapper.Code == 60002) && allowRelogin {
 		d.sessionKey = ""
 		if err := d.login(ctx); err == nil {
 			return d.requestRetry(ctx, method, path, body, false)
@@ -78,9 +80,9 @@ func (d *WxYunPan) login(ctx context.Context) error {
 	acc := d.Addition.Account
 	pw := d.Addition.Password
 	if acc == "" || pw == "" {
-		return fmt.Errorf("鏈厤缃处鍙锋垨瀵嗙爜")
+		return fmt.Errorf("未配置账号或密码")
 	}
-	// 閭蹇呴』鐢?email 瀛楁锛涙墜鏈哄彿鐢?account/phone
+	// 邮箱必须用 email 字段；手机号用 account/phone
 	bodies := []map[string]interface{}{}
 	if contains(acc, "@") {
 		bodies = append(bodies,
@@ -118,14 +120,14 @@ func (d *WxYunPan) login(ctx context.Context) error {
 		}
 		if w.Code == 200 && w.Data.SessionKey != "" {
 			d.sessionKey = w.Data.SessionKey
-			// 鎸佷箙鍖栧埌 driver storage锛岄伩鍏嶆瘡娆￠兘鐧诲綍
+			// 持久化到 driver storage，避免每次都登录
 			op.MustSaveDriverStorage(d)
 			return nil
 		}
-		lastErr = fmt.Errorf("鐧诲綍澶辫触: %s (code=%d)", w.Msg, w.Code)
+		lastErr = fmt.Errorf("登录失败: %s (code=%d)", w.Msg, w.Code)
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("鐧诲綍澶辫触")
+		lastErr = fmt.Errorf("登录失败")
 	}
 	return lastErr
 }
