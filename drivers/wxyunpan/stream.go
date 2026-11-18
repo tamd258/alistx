@@ -5,11 +5,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/http_range"
+	log "github.com/sirupsen/logrus"
 )
+
+// 诊断用：只打前 200 条，排查完可以删掉
+var wxDbgCount int32
+
+func wxDbg() bool {
+	return atomic.AddInt32(&wxDbgCount, 1) <= 200
+}
 
 const (
 	// wxRetryTimes 单次 Range 读取最多重连次数
@@ -90,11 +99,17 @@ func (r *wxResumeReader) open() error {
 	req.Header.Set("Range", spec)
 	resp, err := wxHttpClient.Do(req)
 	if err != nil {
+		if wxDbg() {
+			log.Warnf("[wx] open err off=%d spec=%s err=%v", r.off, spec, err)
+		}
 		return err
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		_ = resp.Body.Close()
 		return fmt.Errorf("wxyunpan: http %d", resp.StatusCode)
+	}
+	if wxDbg() {
+		log.Warnf("[wx] open ok off=%d spec=%s status=%d clen=%s", r.off, spec, resp.StatusCode, resp.Header.Get("Content-Length"))
 	}
 	r.body = resp.Body
 	return nil
@@ -131,6 +146,9 @@ func (r *wxResumeReader) Read(p []byte) (int, error) {
 		}
 		if err == nil {
 			continue
+		}
+		if wxDbg() {
+			log.Warnf("[wx] read err off=%d n=%d err=%v", r.off, n, err)
 		}
 		// 断流 / 提前 EOF / 连接被重置：关掉旧连接，下一轮从当前位置续传
 		_ = r.body.Close()
