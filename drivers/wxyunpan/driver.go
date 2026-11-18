@@ -9,7 +9,6 @@ import (
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/pkg/utils"
 )
 
 type WxYunPan struct {
@@ -104,19 +103,19 @@ func (d *WxYunPan) Link(ctx context.Context, file model.Obj, args model.LinkArgs
 	if url == "" {
 		return nil, fmt.Errorf("未获取到直链")
 	}
-	// PikPak 的下载直链对非 VIP 有单连接截断：实测一条连接读到 ~69MB/79MB 就被服务端关掉，
-	// net/http 抛 unexpected EOF，139 云盘的 Put 在算全文件 SHA256 时 CacheFullInTempFile 直接失败，
-	// 报 "unexpected EOF; CreateTempFile failed"。
-	// 解决：不要单连接整条读，交给 alist 的多线程分片下载器（每片 PartSize，单片失败自动重试）。
-	return &model.Link{
+	// PikPak 直链会随机在任意偏移掐断连接（单连接 ~69/79MB、8MB 分片约 1/4 被截断），
+	// 一次性读完整条流必然 unexpected EOF；139 云盘上传前要算全文件 SHA256（CacheFullInTempFile），
+	// 一断就整体失败 => "unexpected EOF; CreateTempFile failed"。
+	// 所以给 Link 挂一个可续传的 RangeReadCloser（见 stream.go），上层拿到的是连续流。
+	link := &model.Link{
 		URL: url,
 		Header: http.Header{
 			"User-Agent": []string{"okhttp/3.12.13"},
 			"Accept":     []string{"*/*"},
 		},
-		Concurrency: 4,
-		PartSize:    8 * utils.MB,
-	}, nil
+	}
+	link.RangeReadCloser = wxResumableLink(link, file.GetSize())
+	return link, nil
 }
 
 // MakeDir 新建文件夹：POST /disk/addFolder
