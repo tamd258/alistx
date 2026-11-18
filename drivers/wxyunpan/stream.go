@@ -68,16 +68,13 @@ func (r *wxResumeReader) open() error {
 		return io.EOF
 	}
 	begin := r.start + r.off
-	var spec string
-	if r.length >= 0 {
-		last := r.start + r.length - 1
-		if begin > last {
-			return io.EOF
-		}
-		spec = fmt.Sprintf("bytes=%d-%d", begin, last)
-	} else {
-		spec = fmt.Sprintf("bytes=%d-", begin)
+	if r.length >= 0 && r.off >= r.length {
+		return io.EOF
 	}
+	// 注意：一定要发「开放区间」bytes=N-。
+	// 实测 PikPak 对「闭合区间」bytes=N-M 会提前掐断并限速（整文件闭合区间 0.77MB/s，
+	// 同一文件开放区间 4.9MB/s），剩下的长度由 Read 自己数着截断。
+	spec := fmt.Sprintf("bytes=%d-", begin)
 	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, r.url, nil)
 	if err != nil {
 		return err
@@ -104,8 +101,15 @@ func (r *wxResumeReader) open() error {
 }
 
 func (r *wxResumeReader) Read(p []byte) (int, error) {
-	if r.length >= 0 && r.off >= r.length {
-		return 0, io.EOF
+	if r.length >= 0 {
+		remain := r.length - r.off
+		if remain <= 0 {
+			return 0, io.EOF
+		}
+		// 开放区间读多了不要——按剩下的长度截断，避免越过本次 Range 的范围
+		if int64(len(p)) > remain {
+			p = p[:remain]
+		}
 	}
 	var lastErr error
 	for attempt := 0; attempt <= wxRetryTimes; attempt++ {
