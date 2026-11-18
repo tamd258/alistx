@@ -12,25 +12,19 @@ import (
 )
 
 const (
-	// 单次 Range 读取最多重连次数
-	wxRetryTimes = 20
-	// 重连退避基数（毫秒），按次数线性递增，封顶 4s
+	// 鍗曟 Range 璇诲彇鏈€澶氶噸杩炴鏁?	wxRetryTimes = 20
+	// 閲嶈繛閫€閬垮熀鏁帮紙姣锛夛紝鎸夋鏁扮嚎鎬ч€掑锛屽皝椤?4s
 	wxRetryBaseMS = 400
 )
 
-// wxResumableLink 给 Link 装一个「断了就按 Range 续」的 RangeReadCloser。
-//
-// 背景：PikPak 的下载直链会随机在任意偏移处被服务端掐断
-//   - 单连接整条读：实测 ~69MB / ~79MB 处被关，net/http 抛 unexpected EOF
-//   - 8MB 分片读：约 1/4 的请求也会被截断（IncompleteRead）
-//
-// 而 139 云盘（personal_new）上传前必须算整文件 SHA256，走 stream.CacheFullInTempFile
-// 一次性顺序读完，任何一次中断都会让它整体失败，报
-// "unexpected EOF; CreateTempFile failed"。
-//
-// 所以这里把读取做成可续传：每次底层断流就从当前偏移重新发 Range 请求接着读，
-// 对上层是一个连续的 io.ReadCloser。
-func wxResumableLink(link *model.Link, size int64) *model.RangeReadCloser {
+// wxResumableLink 缁?Link 瑁呬竴涓€屾柇浜嗗氨鎸?Range 缁€嶇殑 RangeReadCloser銆?//
+// 鑳屾櫙锛歅ikPak 鐨勪笅杞界洿閾句細闅忔満鍦ㄤ换鎰忓亸绉诲琚湇鍔＄鎺愭柇
+//   - 鍗曡繛鎺ユ暣鏉¤锛氬疄娴?~69MB / ~79MB 澶勮鍏筹紝net/http 鎶?unexpected EOF
+//   - 8MB 鍒嗙墖璇伙細绾?1/4 鐨勮姹備篃浼氳鎴柇锛圛ncompleteRead锛?//
+// 鑰?139 浜戠洏锛坧ersonal_new锛変笂浼犲墠蹇呴』绠楁暣鏂囦欢 SHA256锛岃蛋 stream.CacheFullInTempFile
+// 涓€娆℃€ч『搴忚瀹岋紝浠讳綍涓€娆′腑鏂兘浼氳瀹冩暣浣撳け璐ワ紝鎶?// "unexpected EOF; CreateTempFile failed"銆?//
+// 鎵€浠ヨ繖閲屾妸璇诲彇鍋氭垚鍙画浼狅細姣忔搴曞眰鏂祦灏变粠褰撳墠鍋忕Щ閲嶆柊鍙?Range 璇锋眰鎺ョ潃璇伙紝
+// 瀵逛笂灞傛槸涓€涓繛缁殑 io.ReadCloser銆?func wxResumableLink(link *model.Link, size int64) *model.RangeReadCloser {
 	return &model.RangeReadCloser{
 		RangeReader: func(ctx context.Context, r http_range.Range) (io.ReadCloser, error) {
 			length := r.Length
@@ -56,8 +50,8 @@ type wxResumeReader struct {
 	url    string
 	header http.Header
 	start  int64
-	length int64 // -1 表示直到文件末尾
-	off    int64 // 相对 start 已交付的字节
+	length int64 // -1 琛ㄧず鐩村埌鏂囦欢鏈熬
+	off    int64 // 鐩稿 start 宸蹭氦浠樼殑瀛楄妭
 	body   io.ReadCloser
 	closed bool
 }
@@ -90,7 +84,7 @@ func (r *wxResumeReader) open() error {
 		req.Header.Set("User-Agent", "okhttp/3.12.13")
 	}
 	req.Header.Set("Range", spec)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := wxHttpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -123,21 +117,20 @@ func (r *wxResumeReader) Read(p []byte) (int, error) {
 		n, err := r.body.Read(p)
 		r.off += int64(n)
 		if n > 0 {
-			// 先把读到的数据交出去，错误留到下一次 Read 处理
+			// 鍏堟妸璇诲埌鐨勬暟鎹氦鍑哄幓锛岄敊璇暀鍒颁笅涓€娆?Read 澶勭悊
 			return n, nil
 		}
 		if err == nil {
 			continue
 		}
-		// 断流 / 提前 EOF / 连接被重置：关掉旧连接，下一轮续传
-		_ = r.body.Close()
+		// 鏂祦 / 鎻愬墠 EOF / 杩炴帴琚噸缃細鍏虫帀鏃ц繛鎺ワ紝涓嬩竴杞画浼?		_ = r.body.Close()
 		r.body = nil
 		lastErr = err
 		if r.length >= 0 && r.off >= r.length {
 			return 0, io.EOF
 		}
 		if r.length < 0 && err == io.EOF {
-			// 未知总长时的正常结束
+			// 鏈煡鎬婚暱鏃剁殑姝ｅ父缁撴潫
 			return 0, io.EOF
 		}
 		time.Sleep(r.backoff(attempt))
@@ -145,7 +138,7 @@ func (r *wxResumeReader) Read(p []byte) (int, error) {
 	if lastErr == nil {
 		lastErr = io.ErrUnexpectedEOF
 	}
-	return 0, fmt.Errorf("wxyunpan: 续传 %d 次仍失败（已读 %d 字节）: %w", wxRetryTimes, r.off, lastErr)
+	return 0, fmt.Errorf("wxyunpan: 缁紶 %d 娆′粛澶辫触锛堝凡璇?%d 瀛楄妭锛? %w", wxRetryTimes, r.off, lastErr)
 }
 
 func (r *wxResumeReader) backoff(attempt int) time.Duration {
